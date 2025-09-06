@@ -1,86 +1,180 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { webUiPathWrapper } from '@/webui';
+import { Type, Static } from '@sinclair/typebox';
+import Ajv from 'ajv';
+import fs, { constants } from 'node:fs/promises';
+
 import { resolve } from 'node:path';
-import * as net from 'node:net';
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { deepMerge } from '../utils/object';
+import { themeType } from '../types/theme';
 
 // 限制尝试端口的次数，避免死循环
-const MAX_PORT_TRY = 100;
+// 定义配置的类型
+const WebUiConfigSchema = Type.Object({
+    host: Type.String({ default: '0.0.0.0' }),
+    port: Type.Number({ default: 6099 }),
+    // napcat+<月份日>，例如 napcat0625
+    token: Type.String({ default: 'napcat' + (new Date().getMonth() + 1).toString().padStart(2, '0') + new Date().getDate().toString().padStart(2, '0') }),
+    loginRate: Type.Number({ default: 10 }),
+    autoLoginAccount: Type.String({ default: '' }),
+    theme: themeType,
+    defaultToken: Type.Boolean({ default: true }),
+});
 
-async function tryUsePort(port: number, tryCount: number = 0): Promise<number> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const server = net.createServer();
-      server.on('listening', () => {
-        server.close();
-        resolve(port);
-      });
+export type WebUiConfigType = Static<typeof WebUiConfigSchema>;
 
-      server.on('error', (err: any) => {
-        if (err.code === 'EADDRINUSE') {
-          if (tryCount < MAX_PORT_TRY) {
-            // 使用循环代替递归
-            resolve(tryUsePort(port + 1, tryCount + 1));
-          } else {
-            reject(`端口尝试失败，达到最大尝试次数: ${MAX_PORT_TRY}`);
-          }
-        } else {
-          reject(`遇到错误: ${err.code}`);
-        }
-      });
-
-      // 尝试监听端口
-      server.listen(port);
-    } catch (error) {
-      // 这里捕获到的错误应该是启动服务器时的同步错误
-      reject(`服务器启动时发生错误: ${error}`);
-    }
-  });
-}
-
-export interface WebUiConfigType {
-    port: number;
-    token: string;
-    loginRate: number
-}
 // 读取当前目录下名为 webui.json 的配置文件，如果不存在则创建初始化配置文件
-class WebUiConfigWrapper {
-  WebUiConfigData: WebUiConfigType | undefined = undefined;
-  async GetWebUIConfig(): Promise<WebUiConfigType> {
-    if (this.WebUiConfigData) {
-      return this.WebUiConfigData;
+export class WebUiConfigWrapper {
+    WebUiConfigData: WebUiConfigType | undefined = undefined;
+
+    private validateAndApplyDefaults(config: Partial<WebUiConfigType>): WebUiConfigType {
+        new Ajv({ coerceTypes: true, useDefaults: true }).compile(WebUiConfigSchema)(config);
+        return config as WebUiConfigType;
     }
-    try {
-      const configPath = resolve(__dirname, './config/webui.json');
-      const config: WebUiConfigType = {
-        port: 6099,
-        token: Math.random().toString(36).slice(2),//生成随机密码
-        loginRate: 3
-      };
 
-      if (!existsSync(configPath)) {
-        writeFileSync(configPath, JSON.stringify(config, null, 4));
-      }
-
-      const fileContent = readFileSync(configPath, 'utf-8');
-      const parsedConfig = JSON.parse(fileContent) as WebUiConfigType;
-
-      // 修正端口占用情况
-      const [err, data] = await tryUsePort(parsedConfig.port).then(data => [null, data as number]).catch(err => [err, null]);
-      parsedConfig.port = data;
-      if (err) {
-        //一般没那么离谱 如果真有这么离谱 考虑下 向外抛出异常
-      }
-      this.WebUiConfigData = parsedConfig;
-      return this.WebUiConfigData;
-    } catch (e) {
-      console.error('读取配置文件失败', e);
+    private async ensureConfigFileExists(configPath: string): Promise<void> {
+        const configExists = await fs
+            .access(configPath, constants.F_OK)
+            .then(() => true)
+            .catch(() => false);
+        if (!configExists) {
+            await fs.writeFile(configPath, JSON.stringify(this.validateAndApplyDefaults({}), null, 4));
+        }
     }
-    return {} as WebUiConfigType; // 理论上这行代码到不了，为了保持函数完整性而保留
-  }
+
+    private async readAndValidateConfig(configPath: string): Promise<WebUiConfigType> {
+        const fileContent = await fs.readFile(configPath, 'utf-8');
+        return this.validateAndApplyDefaults(JSON.parse(fileContent));
+    }
+
+    private async writeConfig(configPath: string, config: WebUiConfigType): Promise<void> {
+        const hasWritePermission = await fs
+            .access(configPath, constants.W_OK)
+            .then(() => true)
+            .catch(() => false);
+        if (hasWritePermission) {
+            await fs.writeFile(configPath, JSON.stringify(config, null, 4));
+        } else {
+            console.warn(`文件: ${configPath} 没有写入权限, 配置的更改部分可能会在重启后还原.`);
+        }
+    }
+
+    async GetWebUIConfig(): Promise<WebUiConfigType> {
+        if (this.WebUiConfigData) {
+            return this.WebUiConfigData;
+        }
+        try {
+            const configPath = resolve(webUiPathWrapper.configPath, './webui.json');
+            await this.ensureConfigFileExists(configPath);
+            const parsedConfig = await this.readAndValidateConfig(configPath);
+            this.WebUiConfigData = parsedConfig;
+            return this.WebUiConfigData;
+        } catch (e) {
+            console.log('读取配置文件失败', e);
+            return this.validateAndApplyDefaults({});
+        }
+    }
+
+    async UpdateWebUIConfig(newConfig: Partial<WebUiConfigType>): Promise<void> {
+        const configPath = resolve(webUiPathWrapper.configPath, './webui.json');
+        const currentConfig = await this.GetWebUIConfig();
+        const mergedConfig = deepMerge({ ...currentConfig }, newConfig);
+        const updatedConfig = this.validateAndApplyDefaults(mergedConfig);
+        await this.writeConfig(configPath, updatedConfig);
+        this.WebUiConfigData = updatedConfig;
+    }
+
+    async UpdateToken(oldToken: string, newToken: string): Promise<void> {
+        const currentConfig = await this.GetWebUIConfig();
+        if (currentConfig.token !== oldToken) {
+            throw new Error('旧 token 不匹配');
+        }
+        await this.UpdateWebUIConfig({ token: newToken, defaultToken: false });
+    }
+
+    // 获取日志文件夹路径
+    async GetLogsPath(): Promise<string> {
+        return resolve(webUiPathWrapper.logsPath);
+    }
+
+    // 获取日志列表
+    async GetLogsList(): Promise<string[]> {
+        const logsPath = resolve(webUiPathWrapper.logsPath);
+        const logsExist = await fs
+            .access(logsPath, constants.F_OK)
+            .then(() => true)
+            .catch(() => false);
+        if (logsExist) {
+            return (await fs.readdir(logsPath))
+                .filter((file) => file.endsWith('.log'))
+                .map((file) => file.replace('.log', ''));
+        }
+        return [];
+    }
+
+    // 获取指定日志文件内容
+    async GetLogContent(filename: string): Promise<string> {
+        const logPath = resolve(webUiPathWrapper.logsPath, `${filename}.log`);
+        const logExists = await fs
+            .access(logPath, constants.R_OK)
+            .then(() => true)
+            .catch(() => false);
+        if (logExists) {
+            return await fs.readFile(logPath, 'utf-8');
+        }
+        return '';
+    }
+
+    // 获取字体文件夹内的字体列表
+    async GetFontList(): Promise<string[]> {
+        const fontsPath = resolve(webUiPathWrapper.configPath, './fonts');
+        const fontsExist = await fs
+            .access(fontsPath, constants.F_OK)
+            .then(() => true)
+            .catch(() => false);
+        if (fontsExist) {
+            return (await fs.readdir(fontsPath)).filter((file) => file.endsWith('.ttf'));
+        }
+        return [];
+    }
+
+    // 判断字体是否存在（webui.woff）
+    async CheckWebUIFontExist(): Promise<boolean> {
+        const fontsPath = resolve(webUiPathWrapper.configPath, './fonts');
+        return await fs
+            .access(resolve(fontsPath, './webui.woff'), constants.F_OK)
+            .then(() => true)
+            .catch(() => false);
+    }
+
+    // 获取webui字体文件路径
+    GetWebUIFontPath(): string {
+        return resolve(webUiPathWrapper.configPath, './fonts/webui.woff');
+    }
+
+    getAutoLoginAccount(): string | undefined {
+        return this.WebUiConfigData?.autoLoginAccount;
+    }
+
+    // 获取自动登录账号
+    async GetAutoLoginAccount(): Promise<string> {
+        return (await this.GetWebUIConfig()).autoLoginAccount;
+    }
+
+    // 更新自动登录账号
+    async UpdateAutoLoginAccount(uin: string): Promise<void> {
+        await this.UpdateWebUIConfig({ autoLoginAccount: uin });
+    }
+
+    // 获取主题内容
+    async GetTheme(): Promise<WebUiConfigType['theme']> {
+        const config = await this.GetWebUIConfig();
+
+        return config.theme;
+    }
+
+    // 更新主题内容
+    async UpdateTheme(theme: WebUiConfigType['theme']): Promise<void> {
+        await this.UpdateWebUIConfig({ theme: theme });
+    }
 }
-export const WebUiConfig = new WebUiConfigWrapper();
